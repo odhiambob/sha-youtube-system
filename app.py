@@ -1,12 +1,9 @@
 # app.py
-# SHA YouTube Sentiment — AfriBERTa (Fine-Tuned, Local, Non-Tech UX)
-# Theories embedded in design:
-# - UTAUT2: simple 2-mode flow, minimal inputs, onboarding tip, Advanced toggle, robust infra, free stack cues
-# - TTF: SHA keyword targeting, date window + outlet filters, local AfriBERTa FT, quick summaries, export
-# - Engagement Theory: human-in-the-loop reviewer fields + collaboration log (CSV)
-# - XAI: probabilities + confidence badges, frame label + meaning, keyword cues, optional diagnostics
-#
-# UX: Once analysis starts, setup UI disappears; results show with a single "New analysis" button.
+# SHA YouTube Sentiment — AfriBERTa (Fine-Tuned, Local, Results-Only UI)
+# - Main table shows ONLY: text, label (sentiment)
+# - Optional "Explore one comment" panel shows full record (no review fields)
+# - Works in two modes: Analyze One Link, Explore by Date Range
+# - Loads fine-tuned AfriBERTa locally (no internet required for model)
 
 import os
 import re
@@ -18,10 +15,14 @@ from typing import Optional, List, Dict, Tuple
 import requests
 import pandas as pd
 import streamlit as st
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, TextClassificationPipeline
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    TextClassificationPipeline,
+)
 
 # =============================
-# 0) CONFIG (UTAUT2: facilitating conditions)
+# 0) CONFIG
 # =============================
 YOUTUBE_API_KEY = st.secrets.get("YOUTUBE_API_KEY", os.getenv("YOUTUBE_API_KEY", ""))
 
@@ -29,45 +30,49 @@ USE_FINETUNED = True
 DEFAULT_FINETUNED_PATH = r"C:\Users\HP\Desktop\usiu\afriberta_ft_ckpt\checkpoint-90"
 BASE_MODEL = "cardiffnlp/twitter-roberta-base-sentiment-latest"
 
-# Link mode uses an internal cap (keeps UX simple, predictable)
+# Link mode uses an internal cap for speed/quota
 LINK_COMMENTS_LIMIT = 400
 
-# Mainstream outlets for optional filtering (TTF)
 OUTLETS = ["Citizen TV Kenya", "NTV Kenya", "KTN News", "KBC Channel 1", "TV47 Kenya"]
 
-# SHA targeting (TTF)
 SHA_KEYWORDS = [
-    "sha", "social health authority", "social health insurance",
-    "shif", "social health insurance act", "social health insurance fund",
-    "nhif to sha", "uhc kenya", "health authority kenya"
+    "sha",
+    "social health authority",
+    "social health insurance",
+    "shif",
+    "social health insurance act",
+    "social health insurance fund",
+    "nhif to sha",
+    "uhc kenya",
+    "health authority kenya",
 ]
 
-# Rule cues for title rationale (XAI)
+# Rule cues for title rationale (plain-language explanation)
 FRAME_RULES = {
     "economic": [
-        "cost","costs","afford","affordability","burden","premium","premiums",
-        "fee","fees","levy","levies","penalty","penalties","payment","payments",
-        "tax","taxes","deduct","deduction","charge","charges","funding","budget",
-        "financing","expensive","price","prices"
+        "cost", "costs", "afford", "affordability", "burden", "premium", "premiums",
+        "fee", "fees", "levy", "levies", "penalty", "penalties", "payment", "payments",
+        "tax", "taxes", "deduct", "deduction", "charge", "charges", "funding", "budget",
+        "financing", "expensive", "price", "prices"
     ],
     "governance": [
-        "corruption","graft","accountability","transparency","illicit","illegal",
-        "fraud","embezzle","embezzlement","scandal","investigation","probe",
-        "audit","auditor","court","ruling","judge","judiciary","petition",
-        "tribunal","arrest","arrested","charged","charge sheet","ethics","eacc",
-        "dci","abuse of office","misconduct"
+        "corruption", "graft", "accountability", "transparency", "illicit", "illegal",
+        "fraud", "embezzle", "embezzlement", "scandal", "investigation", "probe",
+        "audit", "auditor", "court", "ruling", "judge", "judiciary", "petition",
+        "tribunal", "arrest", "arrested", "charged", "charge sheet", "ethics", "eacc",
+        "dci", "abuse of office", "misconduct"
     ],
     "implementation": [
-        "rollout","roll-out","registration","register","portal","system","systems",
-        "deadline","deadlines","capacity","guidelines","policy",
-        "phased","pilot","deployment","onboarding","queue","downtime","outage",
-        "training","logistics","readiness","framework","implementation"
+        "rollout", "roll-out", "registration", "register", "portal", "system", "systems",
+        "deadline", "deadlines", "capacity", "guidelines", "policy",
+        "phased", "pilot", "deployment", "onboarding", "queue", "downtime", "outage",
+        "training", "logistics", "readiness", "framework", "implementation"
     ],
     "citizen welfare": [
-        "access","accessibility","quality","equity","coverage","benefit","benefits",
-        "service","services","patients","patient","hospital","hospitals","clinics",
-        "facility","facilities","care","treatment","medicines","drugs","referrals",
-        "affordable care","universal health","waiting time","experience"
+        "access", "accessibility", "quality", "equity", "coverage", "benefit", "benefits",
+        "service", "services", "patients", "patient", "hospital", "hospitals", "clinics",
+        "facility", "facilities", "care", "treatment", "medicines", "drugs", "referrals",
+        "affordable care", "universal health", "waiting time", "experience"
     ],
 }
 
@@ -82,7 +87,7 @@ SEARCH_QUERIES = [
 ]
 
 # =============================
-# Session helpers (for "results-only" mode)
+# Session helpers (results-only flow)
 # =============================
 def _reset_run():
     for k in [
@@ -117,7 +122,6 @@ def is_sha_related(text: str) -> bool:
     return bool(text) and any(k in (text or "").lower() for k in SHA_KEYWORDS)
 
 def detect_title_focus_and_keywords(title: str) -> Tuple[str, List[str]]:
-    """Return dominant focus key and matched keywords; used to craft plain-language rationale."""
     t = (title or "").lower()
     scores = {f: sum(1 for kw in kws if kw in t) for f, kws in FRAME_RULES.items()}
     best = max(scores, key=scores.get)
@@ -132,7 +136,7 @@ def frame_label_for_display(key: str) -> str:
         "economic": "Economic",
         "governance": "Governance",
         "implementation": "Implementation",
-        "other": "Other / Unclear"
+        "other": "Other / Unclear",
     }
     return mapping.get(key, "Other / Unclear")
 
@@ -154,7 +158,7 @@ def parse_video_id_from_url(url: str):
             return m.group(1)
     return None
 
-# Robust HTTP with retries/backoff (UTAUT2: facilitating conditions)
+# Robust HTTP with retries/backoff
 def http_get_with_retries(url: str, params: Dict, timeout: int = 60, max_retries: int = 5) -> requests.Response:
     backoff = 1.5
     delay = 1.0
@@ -203,7 +207,7 @@ def fetch_comments(video_id: str, limit: int = 20):
                 "author": s.get("authorDisplayName"),
                 "text": s.get("textOriginal", ""),
                 "likes": s.get("likeCount", 0),
-                "time": s.get("publishedAt", "")
+                "time": s.get("publishedAt", ""),
             })
             if len(comments) >= limit:
                 break
@@ -273,7 +277,7 @@ def search_sha_videos(start_dt_utc: datetime, end_dt_utc: datetime, max_videos: 
     return videos
 
 # =============================
-# 2) MODEL LOADER (TTF + UTAUT2 reliability)
+# 2) MODEL LOADER
 # =============================
 @st.cache_resource(show_spinner=False)
 def load_pipeline():
@@ -314,13 +318,11 @@ def run_sentiment(pipe, id2label_map, texts: List[str]):
     return results
 
 # =============================
-# 3) SETUP UI only when not running (results-only after start)
+# 3) SETUP UI
 # =============================
 if not st.session_state.get("in_run", False) and not st.session_state.get("ready", False):
     st.title("SHA YouTube Sentiment — AfriBERTa (Fine-Tuned, Local)")
     st.caption("Paste a link or pick dates. Results show sentiment plus a clear explanation of the title’s focus.")
-
-    show_advanced_setup = st.toggle("Advanced (researchers)", value=False, help="Show diagnostics and notes")
 
     if not YOUTUBE_API_KEY:
         st.warning("⚠️ Add your YouTube API key in .streamlit/secrets.toml")
@@ -332,14 +334,13 @@ if not st.session_state.get("in_run", False) and not st.session_state.get("ready
 
     mode = st.radio("Choose how you want to analyze", ["Analyze One Link", "Explore by Date Range"], horizontal=True)
 
-    # Reset state when switching modes (TTF: prevent cross-mode leakage)
     prev_mode = st.session_state.get("prev_mode")
     if prev_mode != mode:
         for k in ["ready", "table_df", "videos", "video_meta", "date_range", "limit_n", "mode"]:
             st.session_state.pop(k, None)
         st.session_state["prev_mode"] = mode
 
-    # ---------- Mode A: Link (no date UI; low effort) ----------
+    # ---------- Mode A: Link ----------
     if mode == "Analyze One Link":
         url = st.text_input("Paste YouTube link (SHA-related):")
         if st.button("Analyze"):
@@ -380,28 +381,20 @@ if not st.session_state.get("in_run", False) and not st.session_state.get("ready
                 "in_run": True,
                 "ready": True,
                 "mode": "single",
-                "video_meta": {
-                    "video_id": vid,
-                    "title": title,
-                    "channelTitle": channel_title,
-                },
-                "table_df": df.assign(
-                    human_label="",
-                    reviewer="",
-                    action="",      # Approved / Not approved
-                ),
+                "video_meta": {"video_id": vid, "title": title, "channelTitle": channel_title},
+                "table_df": df,           # keep full set internally; we show a 2-col view below
                 "model_path": model_path,
             })
             st.rerun()
 
-    # ---------- Mode B: Date range (TTF: scoping + outlet filters) ----------
+    # ---------- Mode B: Date range ----------
     if mode == "Explore by Date Range":
         today = date.today()
         start_default = today - timedelta(days=30)
         dr = st.date_input(
             "Pick date range (UTC publish date)",
             value=(start_default, today),
-            help="Find SHA-related videos published in this window, then fetch & analyze comments."
+            help="Find SHA-related videos published in this window, then fetch & analyze comments.",
         )
         with st.expander("Filter by channel (optional)"):
             outlet_selected = st.multiselect("Channels", OUTLETS, default=OUTLETS)
@@ -463,11 +456,7 @@ if not st.session_state.get("in_run", False) and not st.session_state.get("ready
                 "ready": True,
                 "mode": "range",
                 "videos": vids,
-                "table_df": df.assign(
-                    human_label="",
-                    reviewer="",
-                    action="",
-                ),
+                "table_df": df,    # keep full; display will be text+label
                 "date_range": (start_d.isoformat(), end_d.isoformat()),
                 "limit_n": int(per_video_comments),
                 "model_path": model_path,
@@ -475,7 +464,7 @@ if not st.session_state.get("in_run", False) and not st.session_state.get("ready
             st.rerun()
 
 # =============================
-# 4) RESULTS-ONLY VIEW (UTAUT2 performance; Engagement; XAI)
+# 4) RESULTS (text + sentiment only)
 # =============================
 if st.session_state.get("ready", False):
     df = st.session_state["table_df"]
@@ -489,7 +478,6 @@ if st.session_state.get("ready", False):
         st.write(f"**Title:** {title}")
         st.write(f"**Channel:** {meta.get('channelTitle', '')}")
 
-        # Frame label + meaning
         frame_name = frame_label_for_display(focus_key)
         st.markdown(f"**Frame detected:** {frame_name}")
         st.markdown(
@@ -500,9 +488,7 @@ if st.session_state.get("ready", False):
             st.caption(f"Noticed keywords: {', '.join(matched)}")
         else:
             st.caption("No strong frame keywords detected.")
-
         st.caption(f"Internal comment cap: {LINK_COMMENTS_LIMIT}")
-
     else:
         st.subheader("Videos analyzed")
         vids = st.session_state.get("videos", [])
@@ -526,62 +512,35 @@ if st.session_state.get("ready", False):
     c2.metric("Neutral",  f"{neu}", pct(neu))
     c3.metric("Positive", f"{pos}", pct(pos))
 
-    # Engagement: collaborative review table (notes/priority removed; action choices updated)
-    st.subheader("Comments (model result + your review)")
-    column_cfg = {
-        "author": st.column_config.TextColumn("author", disabled=True),
-        "time": st.column_config.TextColumn("time", disabled=True),
-        "likes": st.column_config.NumberColumn("likes", disabled=True),
-        "text": st.column_config.TextColumn("text", disabled=True),
-        "label": st.column_config.TextColumn("model_label", disabled=True),
-        "score": st.column_config.NumberColumn("probability", disabled=True, format="%.4f"),
-        "confidence": st.column_config.TextColumn("confidence", disabled=True),
-        "time_parsed": st.column_config.DatetimeColumn("publishedAt (UTC)", disabled=True),
-        "human_label": st.column_config.SelectboxColumn(
-            "Your label",
-            options=["", "negative", "neutral", "positive"],
-            help="If the model is wrong, pick the correct label."
-        ),
-        "reviewer": st.column_config.TextColumn("Reviewer"),
-        "action": st.column_config.SelectboxColumn("Action", options=["", "Approved", "Not approved"]),
-    }
-    if mode_used == "range":
-        column_cfg["video_id"] = st.column_config.TextColumn("video_id", disabled=True)
-        column_cfg["video_title"] = st.column_config.TextColumn("video_title", disabled=True)
-        column_cfg["channelTitle"] = st.column_config.TextColumn("channel", disabled=True)
-        column_cfg["video_publishedAt"] = st.column_config.TextColumn("video_publishedAt", disabled=True)
+    # ===== Main table: ONLY text + label (read-only) =====
+    st.subheader("Comments")
+    view_cols = ["text", "label"]
+    missing = [c for c in view_cols if c not in df.columns]
+    if missing:
+        st.warning(f"Missing columns in data: {missing}")
+        st.stop()
 
-    editable = st.data_editor(
-        df,
-        key="comments_editor",
-        use_container_width=True,
-        num_rows="fixed",
-        column_config=column_cfg,
-    )
-    st.session_state["table_df"] = editable
-    st.caption("Mark the model’s output as **Approved** or **Not approved**. If incorrect, also select your label above.")
+    display_df = df[view_cols].copy()
+    st.dataframe(display_df, use_container_width=True)
 
-    # Save collaboration log (only human_label or action triggers save)
-    csave, cexport = st.columns([1,1])
-    with csave:
-        if st.button("Save collaboration log"):
-            changed = editable[
-                (editable["human_label"] != "") | (editable["action"] != "")
-            ].copy()
-            if changed.empty:
-                st.info("Nothing to save yet.")
-            else:
-                changed["saved_at_utc"] = pd.Timestamp.utcnow().isoformat()
-                out_path = "labels_log.csv"
-                changed.to_csv(out_path, mode="a", index=False, header=not os.path.exists(out_path), encoding="utf-8")
-                st.success(f"Saved {len(changed)} row(s) to {out_path}")
+    # Export just the two-column view
+    if st.button("Export comments (text + label) to CSV"):
+        export_path = "analysis_export_text_label.csv"
+        display_df.to_csv(export_path, index=False, encoding="utf-8")
+        st.success(f"Exported to {export_path}")
 
-    # Quick export
-    with cexport:
-        if st.button("Export current results (CSV)"):
-            export_path = "analysis_export.csv"
-            editable.to_csv(export_path, index=False, encoding="utf-8")
-            st.success(f"Exported to {export_path}")
+    # --- Simplified: Explore one comment (details on demand; no review fields) ---
+    with st.expander("Explore one comment (details on demand)"):
+        if len(df) > 0:
+            options = [f"{i}: {str(t)[:80].replace('\n',' ')}" for i, t in enumerate(df["text"].astype(str))]
+            pick = st.selectbox("Pick a row to inspect", options, index=0)
+            row_idx = int(pick.split(":")[0])
+
+            # Show a full record snapshot (but there are no review fields anymore)
+            st.write("**Full record**")
+            st.write(df.loc[row_idx])
+        else:
+            st.info("No rows available to explore.")
 
     # Minimal controls footer
     col_a, col_b = st.columns([1, 1])
