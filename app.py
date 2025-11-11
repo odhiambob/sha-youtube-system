@@ -1,8 +1,9 @@
 # app.py
-# SHA YouTube Sentiment — AfriBERTa (Fine-Tuned, Local, Results-Only UI)
-# - Main table shows ONLY: text, label (sentiment)
-# - Optional "Explore one comment" panel shows full record (no review fields)
-# - Works in two modes: Analyze One Link, Explore by Date Range
+# SHA YouTube Sentiment — AfriBERTa (Fine-Tuned, Local)
+# - Main table: text + label (sentiment)
+# - Explore one comment: hides human_label/reviewer/action in preview ONLY
+# - Full table: includes editable human_label, reviewer, action
+# - Two modes: Analyze One Link / Explore by Date Range
 # - Loads fine-tuned AfriBERTa locally (no internet required for model)
 
 import os
@@ -92,7 +93,8 @@ SEARCH_QUERIES = [
 def _reset_run():
     for k in [
         "ready", "table_df", "videos", "video_meta", "date_range",
-        "limit_n", "mode", "model_path", "in_run", "prev_mode"
+        "limit_n", "mode", "model_path", "in_run", "prev_mode",
+        "show_adv_table"
     ]:
         st.session_state.pop(k, None)
 
@@ -276,6 +278,13 @@ def search_sha_videos(start_dt_utc: datetime, end_dt_utc: datetime, max_videos: 
                 break
     return videos
 
+# ====== NEW: ensure review columns exist for full table ======
+def ensure_review_cols(df: pd.DataFrame) -> pd.DataFrame:
+    for c in ["human_label", "reviewer", "action"]:
+        if c not in df.columns:
+            df[c] = ""
+    return df
+
 # =============================
 # 2) MODEL LOADER
 # =============================
@@ -377,12 +386,15 @@ if not st.session_state.get("in_run", False) and not st.session_state.get("ready
             sent = run_sentiment(pipe, id2label_map, df["text"].astype(str).tolist())
             df = pd.concat([df, pd.DataFrame(sent)], axis=1)
 
+            # ensure review fields exist for full table
+            df = ensure_review_cols(df)
+
             st.session_state.update({
                 "in_run": True,
                 "ready": True,
                 "mode": "single",
                 "video_meta": {"video_id": vid, "title": title, "channelTitle": channel_title},
-                "table_df": df,           # keep full set internally; we show a 2-col view below
+                "table_df": df,           # includes human_label/reviewer/action
                 "model_path": model_path,
             })
             st.rerun()
@@ -451,12 +463,15 @@ if not st.session_state.get("in_run", False) and not st.session_state.get("ready
             sent = run_sentiment(pipe, id2label_map, df["text"].astype(str).tolist())
             df = pd.concat([df, pd.DataFrame(sent)], axis=1)
 
+            # ensure review fields exist for full table
+            df = ensure_review_cols(df)
+
             st.session_state.update({
                 "in_run": True,
                 "ready": True,
                 "mode": "range",
                 "videos": vids,
-                "table_df": df,    # keep full; display will be text+label
+                "table_df": df,    # includes human_label/reviewer/action
                 "date_range": (start_d.isoformat(), end_d.isoformat()),
                 "limit_n": int(per_video_comments),
                 "model_path": model_path,
@@ -529,28 +544,97 @@ if st.session_state.get("ready", False):
         display_df.to_csv(export_path, index=False, encoding="utf-8")
         st.success(f"Exported to {export_path}")
 
-    # --- Simplified: Explore one comment (details on demand; no review fields) ---
+    # --- Explore one comment (details on demand; HIDE review fields only here) ---
     with st.expander("Explore one comment (details on demand)"):
         if len(df) > 0:
             options = [f"{i}: {str(t)[:80].replace('\n',' ')}" for i, t in enumerate(df["text"].astype(str))]
             pick = st.selectbox("Pick a row to inspect", options, index=0)
             row_idx = int(pick.split(":")[0])
 
-            # Show a full record snapshot (but there are no review fields anymore)
-            st.write("**Full record**")
-            st.write(df.loc[row_idx])
+            # Hide only the review columns in this preview; keep df intact for full table
+            hide = {"human_label", "reviewer", "action"}
+            show_cols = [c for c in df.columns if c not in hide]
+            row_view = df.loc[row_idx, show_cols]
+
+            st.write("**Full record (review fields hidden)**")
+            st.dataframe(row_view.to_frame(name="Value"))
         else:
             st.info("No rows available to explore.")
 
-    # Minimal controls footer
+    # ===== Full table with review fields (unchanged) =====
+    show_full = st.toggle("Show full table (review & all columns)", value=st.session_state.get("show_adv_table", False))
+    st.session_state["show_adv_table"] = show_full
+
+    if st.session_state.get("show_adv_table", False):
+        st.subheader("Comments (full view: model result + your review)")
+
+        column_cfg = {
+            "author": st.column_config.TextColumn("author", disabled=True),
+            "time": st.column_config.TextColumn("time", disabled=True),
+            "likes": st.column_config.NumberColumn("likes", disabled=True),
+            "text": st.column_config.TextColumn("text", disabled=True),
+            "label": st.column_config.TextColumn("model_label", disabled=True),
+            "score": st.column_config.NumberColumn("probability", disabled=True, format="%.4f"),
+            "confidence": st.column_config.TextColumn("confidence", disabled=True),
+            "time_parsed": st.column_config.DatetimeColumn("publishedAt (UTC)", disabled=True),
+            "human_label": st.column_config.SelectboxColumn(
+                "Your label",
+                options=["", "negative", "neutral", "positive"],
+                help="If the model is wrong, pick the correct label."
+            ),
+            "reviewer": st.column_config.TextColumn("Reviewer"),
+            "action": st.column_config.SelectboxColumn("Action", options=["", "Approved", "Not approved"]),
+        }
+        if mode_used == "range":
+            column_cfg["video_id"] = st.column_config.TextColumn("video_id", disabled=True)
+            column_cfg["video_title"] = st.column_config.TextColumn("video_title", disabled=True)
+            column_cfg["channelTitle"] = st.column_config.TextColumn("channel", disabled=True)
+            column_cfg["video_publishedAt"] = st.column_config.TextColumn("video_publishedAt", disabled=True)
+
+        editable = st.data_editor(
+            df,
+            key="comments_editor",
+            use_container_width=True,
+            num_rows="fixed",
+            column_config=column_cfg,
+        )
+        st.session_state["table_df"] = editable
+        st.caption(
+            "Mark the model’s output as **Approved** or **Not approved**. "
+            "If incorrect, also select your label above."
+        )
+
+        csave, cexport = st.columns([1, 1])
+        with csave:
+            if st.button("Save collaboration log"):
+                try:
+                    # if columns exist, filter rows with any input in human_label or action
+                    changed = editable[
+                        (editable["human_label"].astype(str) != "") |
+                        (editable["action"].astype(str) != "")
+                    ].copy()
+                except Exception:
+                    changed = pd.DataFrame()
+                if changed.empty:
+                    st.info("Nothing to save yet.")
+                else:
+                    changed["saved_at_utc"] = pd.Timestamp.utcnow().isoformat()
+                    out_path = "labels_log.csv"
+                    changed.to_csv(out_path, mode="a", index=False, header=not os.path.exists(out_path), encoding="utf-8")
+                    st.success(f"Saved {len(changed)} row(s) to {out_path}")
+        with cexport:
+            if st.button("Export full results (CSV)"):
+                export_path = "analysis_export.csv"
+                editable.to_csv(export_path, index=False, encoding="utf-8")
+                st.success(f"Exported to {export_path}")
+
+    # Footer controls
     col_a, col_b = st.columns([1, 1])
     with col_a:
         if st.button("New analysis"):
             _reset_run()
             st.rerun()
     with col_b:
-        show_advanced_results = st.toggle("Advanced (researchers)", value=False, key="adv_results_toggle")
-    if show_advanced_results:
         with st.expander("Diagnostics & Notes"):
             st.markdown("""
 - Date filtering only in **Explore by Date Range**; link mode uses an internal cap for speed and quota safety.
